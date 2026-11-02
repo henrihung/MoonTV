@@ -8,6 +8,10 @@
  */
 
 import {
+  stripAdSegmentsByMediaProfile,
+  stripAdSegmentsFromM3U8,
+} from '@/lib/ad-filter';
+import {
   type SegmentByteRange,
   normalizeByteRange,
 } from '@/lib/video-byte-range';
@@ -15,6 +19,7 @@ import {
   buildSegmentCacheKey,
   DEFAULT_CACHE_SETTINGS,
   loadCacheSettings,
+  probeSegmentProfileCacheFirst,
   readCachedSegment,
   recordSegmentProbe,
   touchMeta,
@@ -54,28 +59,56 @@ export function formatTime(seconds: number): string {
 }
 
 /**
- * 去广告：过滤 M3U8 内容中的 #EXT-X-DISCONTINUITY 标记。
+ * 按需剔除播放列表中的广告分片（仅结构特征，同步）。
+ *
+ * 旧实现只删除 `#EXT-X-DISCONTINUITY` 行：既不删广告分片，又丢掉 PTS
+ * 断点信息，时间轴因此出现空洞（拖动报 `bufferSeekOverHole`、画面回推、
+ * 音画错位、最终撞 MSE 配额）。现在改为真正删除广告分片条目
+ * （见 `@/lib/ad-filter`），所有不连续标记与 KEY/MAP 都保留。
+ *
+ * @param removeAds 是否启用（设置面板里的「去广告」）；默认关闭
  */
-export function filterAdsFromM3U8(m3u8Content: string): string {
-  if (!m3u8Content) return '';
-
-  // 按行分割M3U8内容
-  const lines = m3u8Content.split('\n');
-  const filteredLines: string[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // 只过滤#EXT-X-DISCONTINUITY标识
-    if (!line.includes('#EXT-X-DISCONTINUITY')) {
-      filteredLines.push(line);
-    }
-  }
-
-  return filteredLines.join('\n');
+export function filterAdsFromM3U8(
+  m3u8Content: string,
+  removeAds = false
+): string {
+  if (!m3u8Content || !removeAds) return m3u8Content;
+  return stripAdSegmentsFromM3U8(m3u8Content);
 }
 
-/** 弹幕密度挡位 */
+/**
+ * 按需剔除播放列表中的广告分片（结构特征 + 分片媒体参数，异步）。
+ *
+ * 采集站的 VIP 线路会把广告重新编码后拼进正片：没有 CUE 标记、分片地址
+ * 是同 CDN 的随机哈希、块时长与正文同量级，纯结构规则一条都命不中。
+ * 这类广告由 `stripAdSegmentsByMediaProfile()` 读取分片头部的 SPS，
+ * 按「与正文画面尺寸不一致」来判定（详见 `@/lib/ad-filter`）。
+ *
+ * 探测只读每个块首分片的前 4KB，且**先从 Cache Storage 里取**（预取过的分片
+ * 零网络请求），结果按 URL 缓存、播放器与预取器共用同一条链路
+ * （`probeSegmentProfileCacheFirst`）。任何失败都会退回同步版本，因此这里
+ * 永远不会把播放列表改坏。
+ *
+ * @param baseUrl 播放列表地址，用于解析相对分片地址
+ * @param removeAds 是否启用（设置面板里的「去广告」）；默认关闭
+ */
+export async function filterAdsFromM3U8Async(
+  m3u8Content: string,
+  baseUrl?: string,
+  removeAds = false
+): Promise<string> {
+  if (!m3u8Content || !removeAds) return m3u8Content;
+  try {
+    return await stripAdSegmentsByMediaProfile(m3u8Content, {
+      baseUrl,
+      probe: probeSegmentProfileCacheFirst,
+    });
+  } catch {
+    return stripAdSegmentsFromM3U8(m3u8Content);
+  }
+}
+
+/** 弹幕密度挡位；默认挡位为 `normal`（标准） */
 export type DanmakuDensity = 'sparse' | 'normal' | 'dense';
 
 /** 弹幕密度挡位文案 */
@@ -114,12 +147,12 @@ export const DANMAKU_DENSITY_PRESETS: Record<
   dense: { ratePerLane: 1, perInterval: 3 },
 };
 
-let activeDanmakuDensity: DanmakuDensity = 'sparse';
+let activeDanmakuDensity: DanmakuDensity = 'normal';
 
-/** 设置弹幕密度挡位；非法值回落到疏松。 */
+/** 设置弹幕密度挡位；未设置 / 非法值回落到标准。 */
 export function setDanmakuDensity(density: unknown): DanmakuDensity {
   activeDanmakuDensity =
-    density === 'dense' || density === 'normal' ? density : 'sparse';
+    density === 'sparse' || density === 'dense' ? density : 'normal';
   return activeDanmakuDensity;
 }
 
@@ -492,8 +525,215 @@ export function createDanmakuInitialConfig(): any {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* HLS 内存缓冲预算                                                     */
+/* ------------------------------------------------------------------ */
+
+/** 1MB，按 1024 进制，和浏览器 MSE 的统计口径一致 */
+const MB = 1024 * 1024;
+
+/**
+ * 字节预算的安全系数。
+ *
+ * 播放列表里的 BANDWIDTH 是平均码率，实际分片（尤其是高动态画面）会短暂
+ * 高于它；留 15% 余量，避免"刚好算满"时先撞 SourceBuffer 配额。
+ */
+const BUFFER_SAFETY = 1.15;
+
+/** 前向缓冲的最小有效时长：再短就不足以抗抖动 */
+const MIN_FORWARD_SECONDS = 30;
+
+/** 单个 SourceBuffer 的最小字节预算，避免低码率时算出过小的值 */
+const MIN_BUFFER_BYTES = 32 * MB;
+
+/** 设备档位：0 宽裕 / 1 中等 / 2 紧张 */
+type DeviceTier = 0 | 1 | 2;
+
+/**
+ * 各档设备可安全占用的 MSE 字节预算。
+ *
+ * 取值参考 Chrome 桌面端与移动端 SourceBuffer 的常见配额，并给视频 + 音频
+ * 两个 SourceBuffer 留出余量；超出这个值更容易触发 `bufferFullError`。
+ */
+const DEVICE_BYTE_BUDGET: Record<DeviceTier, number> = {
+  0: 192 * MB,
+  1: 128 * MB,
+  2: 72 * MB,
+};
+
+/** 时长目标：[前向目标, 前向硬上限, 回看时长]（秒） */
+const TIME_TARGETS: Record<
+  'cacheOff' | 'cacheOn',
+  Record<DeviceTier, readonly [number, number, number]>
+> = {
+  // 未开缓存：内存缓冲就是抗抖动的资本，尽量拉长
+  cacheOff: {
+    0: [120, 600, 30],
+    1: [90, 360, 20],
+    2: [60, 180, 15],
+  },
+  // 已开缓存：Cache Storage 读出来几乎零延迟，内存缓冲只需保证平滑
+  cacheOn: {
+    0: [60, 300, 20],
+    1: [45, 240, 15],
+    2: [30, 120, 10],
+  },
+};
+
+export interface HlsBufferPlan {
+  /** 前向缓冲目标（秒） */
+  maxBufferLength: number;
+  /** 前向缓冲硬上限（秒） */
+  maxMaxBufferLength: number;
+  /** 已播放内容的保留时长（秒） */
+  backBufferLength: number;
+  /** MSE 单 SourceBuffer 字节预算（字节） */
+  maxBufferSize: number;
+  /** 目标时长装不进字节预算，已按字节预算回压时长（排查用） */
+  limitedByBytes: boolean;
+}
+
+export interface HlsBufferPlanInput {
+  /** 当前档位码率（bit/s）。未知时只按设备预算给出时长目标 */
+  levelBitrate?: number | null;
+  cacheEnabled?: boolean;
+  /** navigator.deviceMemory（GB，Chrome 上限 8） */
+  deviceMemory?: number;
+  hardwareConcurrency?: number;
+  /** 移动端 / 平板：MSE 配额通常比桌面紧张 */
+  mobile?: boolean;
+  saveData?: boolean;
+}
+
+function resolveDeviceTier(input: HlsBufferPlanInput): DeviceTier {
+  const memory = input.deviceMemory ?? 0;
+  const cores = input.hardwareConcurrency ?? 0;
+  if (
+    input.mobile ||
+    (memory > 0 && memory <= 2) ||
+    (cores > 0 && cores <= 2)
+  ) {
+    return 2;
+  }
+  if ((memory > 0 && memory <= 4) || (cores > 0 && cores <= 4)) return 1;
+  return 0;
+}
+
+/**
+ * 计算 hls.js 的内存缓冲计划。
+ *
+ * hls.js 里两个阈值是相乘关系：
+ *
+ *   maxBufLen = min(maxBufferLength, maxBufferSize / 码率)
+ *
+ * 所以固定 90MB 时，8Mbps 只装得下约 90s——**120s 的目标永远达不成**。
+ * 两套阈值互相打架：hls.js 以为自己还能往前装，实际早已顶到字节上限，
+ * 配额一紧就抛 `bufferFullError`，再走 flush 全缓冲的分支（画面回退）。
+ *
+ * 这里改成由「当前档位码率 × 目标时长」反推字节预算：
+ * - 装得下：字节预算按需放大（上限为设备预算），120s 真的能达成；
+ * - 装不下：字节预算封顶，同时把时长目标回压到能兑现的值，
+ *   保证 `maxBufferLength` 与 `maxBufferSize` 始终自洽。
+ */
+export function planHlsBuffer(input: HlsBufferPlanInput = {}): HlsBufferPlan {
+  const tier = resolveDeviceTier(input);
+  const [targetForward, targetMax, targetBack] =
+    TIME_TARGETS[input.cacheEnabled ? 'cacheOn' : 'cacheOff'][tier];
+
+  let maxBufferLength = targetForward;
+  let maxMaxBufferLength = targetMax;
+  const backBufferLength = targetBack;
+  if (input.saveData) {
+    maxBufferLength = Math.min(maxBufferLength, 45);
+    maxMaxBufferLength = Math.min(maxMaxBufferLength, 240);
+  }
+
+  const byteBudget = DEVICE_BYTE_BUDGET[tier];
+  const bitrate = Number(input.levelBitrate);
+  if (!Number.isFinite(bitrate) || bitrate <= 0) {
+    return {
+      maxBufferLength,
+      maxMaxBufferLength,
+      backBufferLength,
+      maxBufferSize: byteBudget,
+      limitedByBytes: false,
+    };
+  }
+
+  const bytesPerSecond = bitrate / 8;
+  const desired = Math.ceil(
+    (maxBufferLength + backBufferLength) * bytesPerSecond * BUFFER_SAFETY
+  );
+  if (desired <= byteBudget) {
+    return {
+      maxBufferLength,
+      maxMaxBufferLength,
+      backBufferLength,
+      // 不再固定 90MB，按码率与目标时长给足（8Mbps × 120s ≈ 172MB）
+      maxBufferSize: Math.max(MIN_BUFFER_BYTES, desired),
+      limitedByBytes: false,
+    };
+  }
+
+  // 字节预算装不下目标时长：回压时长，避免留下一个永远达不成的目标
+  const affordable = Math.floor(
+    byteBudget / BUFFER_SAFETY / bytesPerSecond - backBufferLength
+  );
+  maxBufferLength = Math.max(
+    MIN_FORWARD_SECONDS,
+    Math.min(maxBufferLength, affordable)
+  );
+  maxMaxBufferLength = Math.max(
+    maxBufferLength,
+    Math.min(maxMaxBufferLength, maxBufferLength * 3)
+  );
+  return {
+    maxBufferLength,
+    maxMaxBufferLength,
+    backBufferLength,
+    maxBufferSize: byteBudget,
+    limitedByBytes: true,
+  };
+}
+
+/** 读取当前设备能力并计算缓冲计划 */
+export function planCurrentHlsBuffer(
+  input: HlsBufferPlanInput = {}
+): HlsBufferPlan {
+  if (typeof navigator === 'undefined') return planHlsBuffer(input);
+  const nav = navigator as Navigator & {
+    deviceMemory?: number;
+    connection?: { saveData?: boolean };
+  };
+  return planHlsBuffer({
+    ...input,
+    deviceMemory: nav.deviceMemory,
+    hardwareConcurrency: nav.hardwareConcurrency,
+    saveData: nav.connection?.saveData,
+    mobile: /Android|iPhone|iPad|iPod|Mobile|HarmonyOS/i.test(
+      nav.userAgent || ''
+    ),
+  });
+}
+
+/** 写回 hls 实例；hls.js 每个 tick 都会读 config，运行期修改立即生效 */
+export function applyHlsBufferPlan(hls: any, plan: HlsBufferPlan): void {
+  const config = hls?.config;
+  if (!config) return;
+  config.maxBufferLength = plan.maxBufferLength;
+  config.maxMaxBufferLength = plan.maxMaxBufferLength;
+  config.backBufferLength = plan.backBufferLength;
+  config.maxBufferSize = plan.maxBufferSize;
+}
+
 export interface HlsLoaderOptions {
-  /** 是否过滤 m3u8 中的 #EXT-X-DISCONTINUITY（去广告） */
+  /**
+   * 是否从点播播放列表中剔除广告分片（设置面板里的「去广告」）。
+   *
+   * 只删除广告分片条目，`#EXT-X-DISCONTINUITY` / KEY / MAP 全部保留，
+   * 因此不会像旧实现那样制造时间轴空洞。直播列表与无法安全判定的
+   * 播放列表会原样返回。
+   */
   blockAd?: boolean;
   /** 片段缓存键是否走同源代理，必须与 VideoPrefetcher 保持一致 */
   useProxy?: boolean;
@@ -507,6 +747,19 @@ export interface HlsLoaderOptions {
  * 关键点：命中缓存时不能上报"耗时 0"。hls.js 的 ABR 用 EWMA 估算带宽，
  * 0 延迟会被当成无限带宽，导致下一批片段直接判到最高码率而卡顿。
  * 这里复用预取时记录的真实耗时，让带宽估算保持连续。
+ *
+ * 另一个必须满足的约束：各阶段时间必须自洽且单调。hls.js 在
+ * `onFragBuffered` 里这样反推"处理耗时"用于带宽采样：
+ *
+ *   processingMs = parsing.end - loading.start
+ *                  - min(loading.first - loading.start, bwEstimator.getEstimateTTFB())
+ *
+ * 如果像旧实现那样把 `parsing` / `buffering` 全填 0，这个差值就是
+ * `0 - (now - span) - ...` 的负数；`EwmaBandWidthEstimator.sample()` 会把负值
+ * 钳到 `minDelayMs`（50ms），等价于**每个命中缓存的分片都被当成 20–300 Mbps
+ * 的下载**。ABR 随即判到最高码率，真实带宽跟不上就卡顿，触发本站的弱网降档；
+ * 换档会 flush 前向缓冲，播放位置因此被打回，听起来就是"画面突然闪回、
+ * 音画不同步"。所以时间线要整体铺在 [start, end] 内：下载 80%、解析 20%。
  */
 function buildCachedStats(
   costMs: number,
@@ -515,7 +768,7 @@ function buildCachedStats(
   const end = performance.now();
   const span = Math.max(1, costMs);
   const start = end - span;
-  const zero = { start: 0, first: 0, end: 0 };
+  const downloadEnd = start + span * 0.8;
   return {
     aborted: false,
     loaded: bytes,
@@ -523,16 +776,16 @@ function buildCachedStats(
     total: bytes,
     chunkCount: 1,
     bwEstimate: (bytes / span) * 1000,
-    loading: { start, first: start + span * 0.6, end },
-    parsing: { ...zero },
-    buffering: { ...zero },
+    loading: { start, first: start + span * 0.2, end: downloadEnd },
+    parsing: { start: downloadEnd, first: downloadEnd, end },
+    buffering: { start: end, first: end, end },
   };
 }
 
 /**
  * 创建「去广告 + 缓存优先」的 HLS Loader。
  *
- * - manifest / level：按需过滤 #EXT-X-DISCONTINUITY
+ * - manifest / level：按需剔除广告分片（不连续标记保持不变）
  * - fragment：先查 Cache Storage（由 VideoPrefetcher 预取填充），命中直接返回，
  *   未命中再走原 loader 回源。因此缓存未命中时行为与默认 loader 完全一致。
  */
@@ -541,7 +794,8 @@ export function createCustomHlsLoader(
   options: HlsLoaderOptions = {}
 ): any {
   const BaseLoader = Hls.DefaultConfig.loader;
-  const useAdFilter = options.blockAd !== false;
+  // 关闭时不改写播放列表，行为与默认 loader 完全一致
+  const useAdFilter = options.blockAd === true;
   const onProbe = options.onProbe ?? recordSegmentProbe;
 
   /**
@@ -619,7 +873,7 @@ export function createCustomHlsLoader(
         const type: string | undefined = rawType as any;
         const url = typeof rawUrl === 'string' ? rawUrl : '';
 
-        // ① 文本播放列表：去广告
+        // ① 文本播放列表：显式开启时剔除广告分片
         if (type === 'manifest' || type === 'level') {
           if (useAdFilter) {
             const onSuccess = callbacks.onSuccess;
@@ -628,10 +882,25 @@ export function createCustomHlsLoader(
               stats: any,
               ctx: any
             ) {
-              if (response.data && typeof response.data === 'string') {
-                response.data = filterAdsFromM3U8(response.data);
+              const data = response?.data;
+              if (typeof data !== 'string') {
+                return onSuccess(response, stats, ctx, null);
               }
-              return onSuccess(response, stats, ctx, null);
+              // 需要读分片头才能判断「广告是不是另一套编码」，所以这里必须
+              // 异步等待；filterAdsFromM3U8Async 内部已兜住所有异常，最坏
+              // 情况就是退回同步的结构特征过滤。
+              const baseUrl =
+                typeof response?.url === 'string' && response.url
+                  ? response.url
+                  : url || undefined;
+              void filterAdsFromM3U8Async(data, baseUrl, true).then(
+                (filtered) => {
+                  // 探测期间 hls.js 可能已经取消（seek / 切码率 / 卸载）
+                  if (cancelled) return;
+                  response.data = filtered;
+                  onSuccess(response, stats, ctx, null);
+                }
+              );
             };
           }
           baseLoad(context, cfg, callbacks);
